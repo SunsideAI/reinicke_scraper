@@ -27,8 +27,15 @@ except ImportError:
 # KONFIGURATION
 # ===========================================================================
 
-BASE = "https://alainreinickeimmobilien.de"
-LIST_URL = f"{BASE}/aktuelle-angebote/"
+BASE = "https://alainreinicke.landingpage.immobilien"
+LIST_URL = f"{BASE}/public"
+
+# Alternative URLs falls nötig
+MAIN_SITE = "https://alainreinickeimmobilien.de"
+ALTERNATIVE_LIST_URLS = [
+    f"{BASE}/public",
+    f"{MAIN_SITE}/aktuelle-angebote/",
+]
 
 # Airtable
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")
@@ -348,34 +355,71 @@ def extract_description(soup: BeautifulSoup, structured_data: dict, page_text: s
 def collect_detail_links() -> List[str]:
     """Sammle alle Detailseiten-Links"""
     print(f"[LIST] Hole {LIST_URL}")
-    soup = soup_get(LIST_URL)
+    
+    try:
+        soup = soup_get(LIST_URL)
+    except Exception as e:
+        print(f"[ERROR] Konnte Seite nicht laden: {e}")
+        return []
     
     links = []
     
-    # Strategie 1: Suche nach typischen Immobilien-Link-Patterns
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        
-        # Mögliche Patterns für Immobilien-Links
-        if any(pattern in href.lower() for pattern in [
-            "/immobilie/", "/objekt/", "/angebot/", "/expose/",
-            "/property/", "immobilien-details", "immodetail"
-        ]):
-            full_url = urljoin(BASE, href)
-            if full_url not in links and BASE in full_url:
-                links.append(full_url)
+    # Debug: Zeige alle Links
+    all_links = soup.find_all("a", href=True)
+    print(f"[DEBUG] Gefunden: {len(all_links)} Links insgesamt")
     
-    # Strategie 2: Links mit Klassen/IDs die auf Immobilien hindeuten
-    for selector in [
-        "a.property-link", "a.immobilie-link", "a.expose-link",
-        ".property-item a", ".immobilie-item a", ".objekt a"
-    ]:
-        for a in soup.select(selector):
-            href = a.get("href")
-            if href:
-                full_url = urljoin(BASE, href)
-                if full_url not in links and BASE in full_url:
+    # Strategie 1: Suche nach "Exposé" oder "Expose" Links
+    for a in all_links:
+        href = a["href"]
+        text = a.get_text(strip=True).lower()
+        
+        # Prüfe ob es ein Exposé-Link ist
+        if "expos" in text or "expose" in text.lower():
+            full_url = urljoin(BASE, href)
+            
+            # Akzeptiere auch andere Domains (landingpage.immobilien)
+            if "landingpage.immobilien" in full_url or BASE in full_url:
+                if full_url not in links:
                     links.append(full_url)
+                    print(f"[DEBUG] Exposé-Link: {full_url}")
+    
+    # Strategie 2: Suche nach Links die "/exposee/" oder "/public/exposee/" enthalten
+    if not links:
+        print("[DEBUG] Strategie 1 (Exposé-Button) fand nichts, versuche URL-Pattern...")
+        
+        for a in all_links:
+            href = a["href"]
+            
+            if "/exposee/" in href.lower() or "/expose/" in href.lower():
+                full_url = urljoin(BASE, href)
+                if full_url not in links:
+                    links.append(full_url)
+                    print(f"[DEBUG] Exposee-URL: {full_url}")
+    
+    # Strategie 3: Alle Links zur landingpage.immobilien Domain
+    if not links:
+        print("[DEBUG] Strategie 2 fand nichts, suche alle landingpage.immobilien Links...")
+        
+        for a in all_links:
+            href = a["href"]
+            full_url = urljoin(BASE, href)
+            
+            if "landingpage.immobilien" in full_url:
+                # Filtere nur relevante Pfade
+                if any(path in full_url for path in ["/exposee/", "/public/", "/immobilie/"]):
+                    if full_url not in links:
+                        links.append(full_url)
+                        print(f"[DEBUG] Landingpage-Link: {full_url}")
+    
+    # Debug: Falls immer noch nichts gefunden
+    if not links:
+        print("\n[DEBUG] Keine Immobilien-Links gefunden!")
+        print("[DEBUG] Hier sind einige Links von der Seite:")
+        for i, a in enumerate(all_links[:15], 1):
+            href = a.get("href", "")
+            text = a.get_text(strip=True)[:50]
+            print(f"  {i}. {text} → {href}")
+        print("\n[HINT] Die Website nutzt: alainreinicke.landingpage.immobilien")
     
     print(f"[LIST] Gefunden: {len(links)} Immobilien")
     return links
