@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Scraper für https://alainreinickeimmobilien.de/aktuelle-angebote/
-Extrahiert Immobilienangebote und synct mit Airtable
+Verbesserter Scraper für https://alainreinickeimmobilien.de/aktuelle-angebote/
+Extrahiert ALLE Immobilienangebote (außer reservierte) mit ALLEN Bildern
 
-Basierend auf DUIS/Streil Scraper v1.7
+Version 3.0 - Vollständige Erfassung
 """
 
 import os
@@ -30,13 +30,6 @@ except ImportError:
 BASE = "https://alainreinicke.landingpage.immobilien"
 LIST_URL = f"{BASE}/public"
 
-# Alternative URLs falls nötig
-MAIN_SITE = "https://alainreinickeimmobilien.de"
-ALTERNATIVE_LIST_URLS = [
-    f"{BASE}/public",
-    f"{MAIN_SITE}/aktuelle-angebote/",
-]
-
 # Airtable
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE = os.getenv("AIRTABLE_BASE", "")
@@ -60,7 +53,8 @@ RE_PRICE = re.compile(r"([\d.,]+)\s*€")
 STOP_STRINGS = [
     "Cookie", "Datenschutz", "Impressum", "Kontakt",
     "Tel:", "Fax:", "E-Mail:", "www.", "http",
-    "© ", "JavaScript", "Alle Rechte", "Footer"
+    "© ", "JavaScript", "Alle Rechte", "Footer",
+    "Geldwäscheprävention", "Weitergabeverbot", "Maklervertrag"
 ]
 
 # ===========================================================================
@@ -204,6 +198,57 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
 # EXTRACTION FUNCTIONS
 # ===========================================================================
 
+def extract_all_images(soup: BeautifulSoup, detail_url: str) -> List[str]:
+    """Extrahiere ALLE Bilder von einer Detailseite"""
+    images = []
+    seen = set()
+    
+    # Suche alle img Tags
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        if not src:
+            continue
+            
+        # Filtere Logo/Icon aus
+        if any(x in src.lower() for x in ["logo", "icon", "favicon", "avatar"]):
+            continue
+        
+        # Prüfe auf typische Bild-Dateien
+        if any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            # Mache absolute URL
+            if not src.startswith("http"):
+                src = urljoin(detail_url, src)
+            
+            # Dedupliziere
+            if src not in seen:
+                seen.add(src)
+                images.append(src)
+    
+    # Suche auch in data-src Attributen (Lazy Loading)
+    for img in soup.find_all("img"):
+        data_src = img.get("data-src", "")
+        if data_src and any(ext in data_src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            if not data_src.startswith("http"):
+                data_src = urljoin(detail_url, data_src)
+            if data_src not in seen:
+                seen.add(data_src)
+                images.append(data_src)
+    
+    # Suche in CSS Background Images
+    for elem in soup.find_all(style=True):
+        style = elem.get("style", "")
+        bg_urls = re.findall(r'background-image:\s*url\(["\']?([^"\']+)["\']?\)', style)
+        for bg_url in bg_urls:
+            if any(ext in bg_url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                if not bg_url.startswith("http"):
+                    bg_url = urljoin(detail_url, bg_url)
+                if bg_url not in seen:
+                    seen.add(bg_url)
+                    images.append(bg_url)
+    
+    print(f"  [BILDER] Gefunden: {len(images)} Bilder")
+    return images
+
 def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     """Extrahiere Preis"""
     # Suche nach verschiedenen Preis-Patterns
@@ -244,216 +289,207 @@ def extract_plz_ort(text: str, title: str = "") -> str:
     """Extrahiere PLZ und Ort"""
     blacklist = [
         "mietvertrag", "kaufvertrag", "zimmer", "kaufen", "mieten",
-        "haus", "wohnung", "objekt", "immobilie", "verfügbar",
-        "zu", "mit", "der", "die", "das", "den", "verkaufen"
+        "javascript", "cookie", "datenschutz", "telefon"
     ]
     
-    # Pattern 1: "Lage" oder "Ort" Abschnitt
-    for header in ["Lage", "Ort", "Standort", "Adresse"]:
-        pattern = rf"{header}\s+(.+?)(?=\n[A-Z][a-z]+\s|\n\n|$)"
-        m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        if m:
-            lage_text = m.group(1)
-            plz_match = RE_PLZ_ORT.search(lage_text)
-            if plz_match:
-                plz, ort = plz_match.groups()
-                ort = ort.strip()
-                if ort.lower() not in blacklist:
-                    return f"{plz} {ort}"
-    
-    # Pattern 2: Standard PLZ + Ort
-    m = RE_PLZ_ORT.search(text)
-    if m:
-        plz, ort = m.groups()
-        ort = ort.strip()
-        if ort.lower() not in blacklist:
+    # Suche im Text
+    for match in RE_PLZ_ORT.finditer(text):
+        plz = match.group(1)
+        ort = _norm(match.group(2))
+        
+        # Filtere Blacklist
+        if any(b in ort.lower() for b in blacklist):
+            continue
+        
+        # Plausibilitätsprüfung
+        if len(ort) > 3 and ort[0].isupper():
             return f"{plz} {ort}"
     
-    # Pattern 3: Aus Titel "in ORTSNAME"
+    # Suche im Titel
     if title:
-        m = re.search(r"\bin\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[a-zäöüß]+)?)", title)
+        m = RE_PLZ_ORT.search(title)
         if m:
-            ort = m.group(1)
-            if ort.lower() not in blacklist:
-                plz_match = re.search(r"\b(\d{5})\b", text[:1000])
-                if plz_match:
-                    return f"{plz_match.group(1)} {ort}"
-                return ort
-    
-    # Pattern 4: Aus URL
-    url_match = re.search(r'-in-([a-z\-]+)/?', title.lower())
-    if url_match:
-        ort_slug = url_match.group(1).replace('-', ' ')
-        return ort_slug.title()
+            return f"{m.group(1)} {_norm(m.group(2))}"
     
     return ""
 
 def extract_description(soup: BeautifulSoup, structured_data: dict, page_text: str) -> str:
     """Extrahiere Beschreibung"""
-    lines = []
+    sections = []
     
-    # Strukturierte Daten
-    strukturiert = []
-    for key in ["Objekttyp", "Vermarktungsart", "Wohnfläche", "Grundstücksgröße", "Zimmer", "Baujahr"]:
-        if structured_data.get(key):
-            strukturiert.append(f"{key}: {structured_data[key]}")
+    # Objektdaten
+    obj_lines = []
+    for key, val in structured_data.items():
+        if val:
+            obj_lines.append(f"{key}: {val}")
     
-    if strukturiert:
-        lines.append("=== OBJEKTDATEN ===")
-        lines.extend(strukturiert)
-        lines.append("")
+    if obj_lines:
+        sections.append("=== OBJEKTDATEN ===\n\n" + "\n\n".join(obj_lines))
     
-    # Freitext-Beschreibung
+    # Beschreibung aus bestimmten Sections
+    desc_selectors = [
+        "div.property-description",
+        "div.beschreibung",
+        "section.description",
+        "div.expose-text",
+        "div.object-description"
+    ]
+    
     desc_lines = []
+    for selector in desc_selectors:
+        elem = soup.select_one(selector)
+        if elem:
+            text = elem.get_text("\n", strip=True)
+            lines = [_norm(l) for l in text.split("\n")]
+            desc_lines.extend(lines)
     
-    # Strategie 1: Suche nach bekannten Abschnitten
-    for header in ["Beschreibung", "Objektbeschreibung", "Lage", "Ausstattung", "Sonstiges"]:
-        pattern = rf"{header}\s+(.+?)(?=\n[A-Z][a-z]+\s+[A-Z]|\n\n[A-Z]|$)"
-        m = re.search(pattern, page_text, re.IGNORECASE | re.DOTALL)
-        if m:
-            text = _norm(m.group(1))
-            paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-            for para in paragraphs[:10]:
-                if len(para) > 50 and not any(skip in para for skip in STOP_STRINGS):
-                    if not desc_lines or desc_lines[-1] != f"\n{header}":
-                        desc_lines.append(f"\n{header}")
-                    desc_lines.append(para)
-                    break
-    
-    # Strategie 2: Alle längeren Paragraphen
+    # Falls keine spezifischen Sections gefunden
     if not desc_lines:
-        for p in soup.find_all("p"):
-            text = _norm(p.get_text(" ", strip=True))
-            if text and len(text) > 100:
-                if not any(skip in text for skip in STOP_STRINGS):
-                    desc_lines.append(text)
+        # Suche nach längeren Textblöcken
+        for p in soup.find_all(["p", "div"]):
+            text = p.get_text(strip=True)
+            if len(text) > 50:
+                desc_lines.append(text)
     
-    # Strategie 3: Aus page_text extrahieren
-    if not desc_lines:
-        paragraphs = page_text.split("\n")
-        for para in paragraphs:
-            para = _norm(para)
-            if len(para) > 100 and not any(skip in para for skip in STOP_STRINGS):
-                desc_lines.append(para)
-                if len(desc_lines) >= 5:
-                    break
-    
+    # Bereinige Zeilen
     desc_lines = _clean_desc_lines(desc_lines)
     
     if desc_lines:
-        lines.append("=== BESCHREIBUNG ===")
-        lines.extend(desc_lines)
+        sections.append("=== BESCHREIBUNG ===\n\n" + "\n\n".join(desc_lines[:20]))  # Limit auf 20 Zeilen
     
-    if lines:
-        return "\n\n".join(lines)[:12000]
-    return ""
+    return "\n\n".join(sections)
 
 # ===========================================================================
 # SCRAPING FUNCTIONS
 # ===========================================================================
 
 def collect_detail_links() -> List[str]:
-    """Sammle alle Detailseiten-Links"""
-    print(f"[LIST] Hole {LIST_URL}")
-    
-    try:
-        soup = soup_get(LIST_URL)
-    except Exception as e:
-        print(f"[ERROR] Konnte Seite nicht laden: {e}")
-        return []
+    """
+    Sammle ALLE Immobilien-Links von der Listenseite
+    Verbesserte Logik um auch dynamisch geladene Links zu finden
+    """
+    print(f"[LIST] Lade: {LIST_URL}")
+    soup = soup_get(LIST_URL, delay=2.0)
+    page_text = soup.get_text()
+    html_content = str(soup)
     
     links = []
     seen = set()
     
-    # Debug: Zeige alle Links
-    all_links = soup.find_all("a", href=True)
-    print(f"[DEBUG] Gefunden: {len(all_links)} Links insgesamt")
+    # Methode 1: Suche <a> Tags mit href
+    print("[DEBUG] Methode 1: Suche <a> Tags...")
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        if "exposee" in href.lower():
+            # Mache absolute URL
+            if not href.startswith("http"):
+                href = urljoin(BASE, href)
+            if href not in seen:
+                seen.add(href)
+                links.append(href)
     
-    # Strategie 1: Alle Exposé-Links (Button-Text egal)
-    for a in all_links:
-        href = a["href"]
-        full_url = urljoin(BASE, href)
-        
-        # Prüfe ob es ein landingpage.immobilien Link ist
-        if "landingpage.immobilien" in full_url:
-            # Muss /exposee/ enthalten
-            if "/exposee/" in full_url or "/public/" in full_url:
-                if full_url not in seen:
-                    seen.add(full_url)
-                    links.append(full_url)
-                    print(f"[DEBUG] Link #{len(links)}: {full_url[:80]}...")
+    print(f"[DEBUG] Nach Methode 1: {len(links)} Links")
     
-    # Strategie 2: Suche speziell nach Exposé-Pattern
-    if not links:
-        print("[DEBUG] Strategie 1 fand nichts, suche nach Exposé-Pattern...")
-        
-        # Suche nach allen Links die das Exposé-Pattern haben
-        import re
-        exposee_pattern = re.compile(r'landingpage\.immobilien/public/exposee/')
-        
-        for a in all_links:
-            href = a.get("href", "")
-            if exposee_pattern.search(href):
-                full_url = urljoin(BASE, href)
-                if full_url not in seen:
-                    seen.add(full_url)
-                    links.append(full_url)
-    
-    # Strategie 3: Parse auch aus JavaScript/Data-Attributen
-    if len(links) < 5:  # Wenn zu wenige gefunden
-        print(f"[DEBUG] Nur {len(links)} Links gefunden, suche in Data-Attributen...")
-        
-        # Suche nach data-href, data-url, etc.
-        for tag in soup.find_all(attrs={"data-href": True}):
-            href = tag["data-href"]
-            if "landingpage.immobilien" in href:
-                full_url = urljoin(BASE, href)
-                if full_url not in seen:
-                    seen.add(full_url)
-                    links.append(full_url)
-        
-        for tag in soup.find_all(attrs={"data-url": True}):
-            href = tag["data-url"]
-            if "landingpage.immobilien" in href:
-                full_url = urljoin(BASE, href)
-                if full_url not in seen:
-                    seen.add(full_url)
-                    links.append(full_url)
-    
-    # Strategie 4: Suche im kompletten HTML-Text nach URLs
-    if len(links) < 5:
-        print(f"[DEBUG] Nur {len(links)} Links, suche im HTML-Text...")
-        
-        html_text = str(soup)
-        import re
-        # Suche nach allen landingpage.immobilien URLs
-        url_pattern = re.compile(r'https?://[^"\s]+landingpage\.immobilien/public/exposee/[^"\s]+')
-        found_urls = url_pattern.findall(html_text)
-        
-        for url in found_urls:
-            # Bereinige URL (entferne trailing quotes etc)
-            url = url.rstrip('",\'};])')
+    # Methode 2: Suche in onclick Events
+    print("[DEBUG] Methode 2: Suche onclick Events...")
+    for elem in soup.find_all(onclick=True):
+        onclick = elem.get("onclick", "")
+        # Suche URLs in onclick
+        urls = re.findall(r'["\']([^"\']*exposee[^"\']*)["\']', onclick)
+        for url in urls:
+            if not url.startswith("http"):
+                url = urljoin(BASE, url)
             if url not in seen:
                 seen.add(url)
                 links.append(url)
-                print(f"[DEBUG] Regex-Match #{len(links)}: {url[:80]}...")
     
-    # Debug: Falls immer noch zu wenige
-    if len(links) < 8:
-        print(f"\n[WARN] Nur {len(links)} Links gefunden - eventuell lädt die Seite mehr via JavaScript!")
-        print("[HINT] Kategorien auf der Seite prüfen:")
-        
-        # Suche nach Kategorie-Überschriften
-        for h2 in soup.find_all(["h2", "h3"]):
-            text = h2.get_text(strip=True)
-            if any(word in text.lower() for word in ["einfamilien", "wohnung", "grundstück", "gewerbe"]):
-                print(f"  - {text}")
+    print(f"[DEBUG] Nach Methode 2: {len(links)} Links")
     
-    print(f"[LIST] Gefunden: {len(links)} Immobilien")
-    return links
+    # Methode 3: Suche in data-Attributen
+    print("[DEBUG] Methode 3: Suche data-Attribute...")
+    for elem in soup.find_all(attrs={"data-url": True}):
+        url = elem.get("data-url", "")
+        if "exposee" in url.lower():
+            if not url.startswith("http"):
+                url = urljoin(BASE, url)
+            if url not in seen:
+                seen.add(url)
+                links.append(url)
+    
+    for elem in soup.find_all(attrs={"data-href": True}):
+        url = elem.get("data-href", "")
+        if "exposee" in url.lower():
+            if not url.startswith("http"):
+                url = urljoin(BASE, url)
+            if url not in seen:
+                seen.add(url)
+                links.append(url)
+    
+    print(f"[DEBUG] Nach Methode 3: {len(links)} Links")
+    
+    # Methode 4: Regex-Suche im gesamten HTML
+    print("[DEBUG] Methode 4: Regex-Suche im HTML...")
+    # Suche nach propstack URLs
+    patterns = [
+        r'https://alainreinicke\.landingpage\.immobilien/public/exposee/[^\s"\'\)<>]+',
+        r'/public/exposee/[^\s"\'\)<>]+',
+        r'href=["\']([^"\']*exposee[^"\']*)["\']',
+    ]
+    
+    for pattern in patterns:
+        found_urls = re.findall(pattern, html_content)
+        for url in found_urls:
+            # Bereinige URL
+            url = url.rstrip('",\'};])')
+            if not url.startswith("http"):
+                url = urljoin(BASE, url)
+            if url not in seen:
+                seen.add(url)
+                links.append(url)
+    
+    print(f"[DEBUG] Nach Methode 4: {len(links)} Links")
+    
+    # Methode 5: Suche in JavaScript/JSON Blöcken
+    print("[DEBUG] Methode 5: Suche in Scripts...")
+    for script in soup.find_all("script"):
+        script_text = script.string if script.string else ""
+        if "exposee" in script_text:
+            # Suche URLs
+            urls = re.findall(r'["\']([^"\']*exposee[^"\']*)["\']', script_text)
+            for url in urls:
+                url = url.rstrip('",\'};])')
+                if not url.startswith("http"):
+                    url = urljoin(BASE, url)
+                if url not in seen and len(url) > 30:  # Filter zu kurze URLs
+                    seen.add(url)
+                    links.append(url)
+    
+    print(f"[DEBUG] Nach Methode 5: {len(links)} Links")
+    
+    # Filtere "reserviert" aus
+    filtered_links = []
+    for link in links:
+        # Prüfe ob Link "reserviert" enthält
+        if "reserviert" not in link.lower():
+            filtered_links.append(link)
+        else:
+            print(f"  [SKIP] Reserviert: {link[:80]}...")
+    
+    print(f"\n[LIST] Gesamt: {len(links)} Links gefunden")
+    print(f"[LIST] Gefiltert (ohne reserviert): {len(filtered_links)} Links")
+    
+    # Debug Output
+    if len(filtered_links) < 8:
+        print(f"\n[WARN] Nur {len(filtered_links)} Links gefunden!")
+        print("[HINT] Die Website lädt möglicherweise mehr Inhalte via JavaScript.")
+        print("[HINT] Prüfe die Website manuell im Browser.")
+    
+    return filtered_links
 
 def parse_detail(detail_url: str) -> dict:
-    """Parse Detailseite"""
+    """Parse Detailseite und extrahiere ALLE Daten inklusive ALLER Bilder"""
+    print(f"  [PARSE] {detail_url[:80]}...")
+    
     soup = soup_get(detail_url)
     page_text = soup.get_text("\n", strip=True)
     
@@ -476,16 +512,14 @@ def parse_detail(detail_url: str) -> dict:
     # PLZ/Ort
     ort = extract_plz_ort(page_text, title)
     
-    # Bild-URL
-    image_url = ""
-    for img in soup.find_all("img"):
-        src = img.get("src", "")
-        # Filtere Logo/Icon aus
-        if src and not any(x in src.lower() for x in ["logo", "icon", "favicon"]):
-            # Prüfe auf typische Bild-Dateien
-            if any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-                image_url = src if src.startswith("http") else urljoin(BASE, src)
-                break
+    # ALLE Bilder extrahieren
+    all_images = extract_all_images(soup, detail_url)
+    
+    # Erstes Bild für Kompatibilität
+    image_url = all_images[0] if all_images else ""
+    
+    # Alle Bilder als komma-separierte Liste
+    all_images_str = ", ".join(all_images) if all_images else ""
     
     # Vermarktungsart
     vermarktungsart = "Kaufen"
@@ -550,11 +584,16 @@ def parse_detail(detail_url: str) -> dict:
         "Preis": preis,
         "Ort": ort,
         "Bild_URL": image_url,
+        "Alle_Bilder": all_images_str,
+        "Anzahl_Bilder": len(all_images),
     }
 
 def make_record(row: dict) -> dict:
     """Erstelle Airtable-Record"""
     preis_value = parse_price_to_number(row["Preis"])
+    
+    # Für Airtable - verwende nur erstes Bild im "Bild" Feld
+    # aber speichere alle Bilder im "Alle_Bilder" Feld
     return {
         "Titel": row["Titel"],
         "Kategorie": row["Kategorie"],
@@ -562,6 +601,8 @@ def make_record(row: dict) -> dict:
         "Objektnummer": row["Objektnummer"],
         "Beschreibung": row["Beschreibung"],
         "Bild": row["Bild_URL"],
+        "Alle_Bilder": row["Alle_Bilder"],
+        "Anzahl_Bilder": row["Anzahl_Bilder"],
         "Preis": preis_value,
         "Standort": row["Ort"],
     }
@@ -582,13 +623,16 @@ def unique_key(fields: dict) -> str:
 
 def run():
     """Hauptfunktion"""
-    print("[REINICKE] Starte Scraper für alainreinickeimmobilien.de")
+    print("[REINICKE v3] Starte Scraper für alainreinickeimmobilien.de")
+    print("[INFO] Ziel: ALLE Immobilien (außer reservierte) mit ALLEN Bildern\n")
     
     # Sammle Links
     try:
         detail_links = collect_detail_links()
     except Exception as e:
         print(f"[ERROR] Fehler beim Sammeln der Links: {e}")
+        import traceback
+        traceback.print_exc()
         return
     
     if not detail_links:
@@ -599,16 +643,19 @@ def run():
     all_rows = []
     for i, url in enumerate(detail_links, 1):
         try:
-            print(f"[SCRAPE] {i}/{len(detail_links)} | {url}")
+            print(f"\n[SCRAPE] {i}/{len(detail_links)}")
             row = parse_detail(url)
             record = make_record(row)
             
             # Zeige Vorschau
-            print(f"  → {record['Kategorie']:8} | {record['Titel'][:60]} | {record.get('Standort', 'N/A')}")
+            print(f"  → {record['Kategorie']:8} | {record['Titel'][:50]}")
+            print(f"  → Bilder: {record['Anzahl_Bilder']} | {record.get('Standort', 'N/A')}")
             
             all_rows.append(record)
         except Exception as e:
             print(f"[ERROR] Fehler bei {url}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
     if not all_rows:
@@ -616,13 +663,20 @@ def run():
         return
     
     # Speichere CSV
-    csv_file = "reinicke_immobilien.csv"
-    cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Beschreibung", "Bild", "Preis", "Standort"]
+    csv_file = "reinicke_immobilien_v3.csv"
+    cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Beschreibung", 
+            "Bild", "Alle_Bilder", "Anzahl_Bilder", "Preis", "Standort"]
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows(all_rows)
-    print(f"\n[CSV] Gespeichert: {csv_file} ({len(all_rows)} Zeilen)")
+    
+    print(f"\n{'='*70}")
+    print(f"[✓] Erfolgreich abgeschlossen!")
+    print(f"[✓] Gespeichert: {csv_file}")
+    print(f"[✓] Immobilien: {len(all_rows)}")
+    print(f"[✓] Gesamt Bilder: {sum(r['Anzahl_Bilder'] for r in all_rows)}")
+    print(f"{'='*70}\n")
     
     # Airtable Sync
     if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
