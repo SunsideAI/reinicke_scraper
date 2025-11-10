@@ -363,63 +363,91 @@ def collect_detail_links() -> List[str]:
         return []
     
     links = []
+    seen = set()
     
     # Debug: Zeige alle Links
     all_links = soup.find_all("a", href=True)
     print(f"[DEBUG] Gefunden: {len(all_links)} Links insgesamt")
     
-    # Strategie 1: Suche nach "Exposé" oder "Expose" Links
+    # Strategie 1: Alle Exposé-Links (Button-Text egal)
     for a in all_links:
         href = a["href"]
-        text = a.get_text(strip=True).lower()
+        full_url = urljoin(BASE, href)
         
-        # Prüfe ob es ein Exposé-Link ist
-        if "expos" in text or "expose" in text.lower():
-            full_url = urljoin(BASE, href)
-            
-            # Akzeptiere auch andere Domains (landingpage.immobilien)
-            if "landingpage.immobilien" in full_url or BASE in full_url:
-                if full_url not in links:
+        # Prüfe ob es ein landingpage.immobilien Link ist
+        if "landingpage.immobilien" in full_url:
+            # Muss /exposee/ enthalten
+            if "/exposee/" in full_url or "/public/" in full_url:
+                if full_url not in seen:
+                    seen.add(full_url)
                     links.append(full_url)
-                    print(f"[DEBUG] Exposé-Link: {full_url}")
+                    print(f"[DEBUG] Link #{len(links)}: {full_url[:80]}...")
     
-    # Strategie 2: Suche nach Links die "/exposee/" oder "/public/exposee/" enthalten
+    # Strategie 2: Suche speziell nach Exposé-Pattern
     if not links:
-        print("[DEBUG] Strategie 1 (Exposé-Button) fand nichts, versuche URL-Pattern...")
+        print("[DEBUG] Strategie 1 fand nichts, suche nach Exposé-Pattern...")
+        
+        # Suche nach allen Links die das Exposé-Pattern haben
+        import re
+        exposee_pattern = re.compile(r'landingpage\.immobilien/public/exposee/')
         
         for a in all_links:
-            href = a["href"]
-            
-            if "/exposee/" in href.lower() or "/expose/" in href.lower():
-                full_url = urljoin(BASE, href)
-                if full_url not in links:
-                    links.append(full_url)
-                    print(f"[DEBUG] Exposee-URL: {full_url}")
-    
-    # Strategie 3: Alle Links zur landingpage.immobilien Domain
-    if not links:
-        print("[DEBUG] Strategie 2 fand nichts, suche alle landingpage.immobilien Links...")
-        
-        for a in all_links:
-            href = a["href"]
-            full_url = urljoin(BASE, href)
-            
-            if "landingpage.immobilien" in full_url:
-                # Filtere nur relevante Pfade
-                if any(path in full_url for path in ["/exposee/", "/public/", "/immobilie/"]):
-                    if full_url not in links:
-                        links.append(full_url)
-                        print(f"[DEBUG] Landingpage-Link: {full_url}")
-    
-    # Debug: Falls immer noch nichts gefunden
-    if not links:
-        print("\n[DEBUG] Keine Immobilien-Links gefunden!")
-        print("[DEBUG] Hier sind einige Links von der Seite:")
-        for i, a in enumerate(all_links[:15], 1):
             href = a.get("href", "")
-            text = a.get_text(strip=True)[:50]
-            print(f"  {i}. {text} → {href}")
-        print("\n[HINT] Die Website nutzt: alainreinicke.landingpage.immobilien")
+            if exposee_pattern.search(href):
+                full_url = urljoin(BASE, href)
+                if full_url not in seen:
+                    seen.add(full_url)
+                    links.append(full_url)
+    
+    # Strategie 3: Parse auch aus JavaScript/Data-Attributen
+    if len(links) < 5:  # Wenn zu wenige gefunden
+        print(f"[DEBUG] Nur {len(links)} Links gefunden, suche in Data-Attributen...")
+        
+        # Suche nach data-href, data-url, etc.
+        for tag in soup.find_all(attrs={"data-href": True}):
+            href = tag["data-href"]
+            if "landingpage.immobilien" in href:
+                full_url = urljoin(BASE, href)
+                if full_url not in seen:
+                    seen.add(full_url)
+                    links.append(full_url)
+        
+        for tag in soup.find_all(attrs={"data-url": True}):
+            href = tag["data-url"]
+            if "landingpage.immobilien" in href:
+                full_url = urljoin(BASE, href)
+                if full_url not in seen:
+                    seen.add(full_url)
+                    links.append(full_url)
+    
+    # Strategie 4: Suche im kompletten HTML-Text nach URLs
+    if len(links) < 5:
+        print(f"[DEBUG] Nur {len(links)} Links, suche im HTML-Text...")
+        
+        html_text = str(soup)
+        import re
+        # Suche nach allen landingpage.immobilien URLs
+        url_pattern = re.compile(r'https?://[^"\s]+landingpage\.immobilien/public/exposee/[^"\s]+')
+        found_urls = url_pattern.findall(html_text)
+        
+        for url in found_urls:
+            # Bereinige URL (entferne trailing quotes etc)
+            url = url.rstrip('",\'};])')
+            if url not in seen:
+                seen.add(url)
+                links.append(url)
+                print(f"[DEBUG] Regex-Match #{len(links)}: {url[:80]}...")
+    
+    # Debug: Falls immer noch zu wenige
+    if len(links) < 8:
+        print(f"\n[WARN] Nur {len(links)} Links gefunden - eventuell lädt die Seite mehr via JavaScript!")
+        print("[HINT] Kategorien auf der Seite prüfen:")
+        
+        # Suche nach Kategorie-Überschriften
+        for h2 in soup.find_all(["h2", "h3"]):
+            text = h2.get_text(strip=True)
+            if any(word in text.lower() for word in ["einfamilien", "wohnung", "grundstück", "gewerbe"]):
+                print(f"  - {text}")
     
     print(f"[LIST] Gefunden: {len(links)} Immobilien")
     return links
